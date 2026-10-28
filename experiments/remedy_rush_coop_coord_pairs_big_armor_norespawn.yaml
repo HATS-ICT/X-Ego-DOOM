@@ -1,0 +1,224 @@
+wandb_project: doom-marl-cl
+use_wandb: false
+eval:
+  every_n_iters: 5
+  enable_video: true
+  video_every_n_evals: 1
+  enable_trajectory_plot: true
+  trajectory_plot_every_n_evals: 1
+checkpoint_every_n_iters: 100
+
+# Toggle the DebugDiagnostics callback (verbose batch/train-step/train-end
+# rich-coloured prints from doom_marl.callbacks.DebugDiagnostics). Off by
+# default — flip to true when diagnosing a non-learning pipeline.
+debug_diagnostics: false
+
+scenario_dir: remedy_rush_coop
+variant: coord_pairs_big_armor_norespawn
+num_agents: 2
+resolution: "160X120"
+skip_frames: 4
+async_mode: true
+host_address: "127.0.0.1"
+netmode: 1
+ticrate: 35
+daemon: true
+render_mode: rgb_array
+# Episode length in vizdoom *game tics* (not env steps). Passed directly to
+# `game.set_episode_timeout`, which OVERRIDES the `episode_timeout` value in
+# the scenario's base.cfg. With skip_frames=4, 1000 tics ≈ 250 env steps per
+# episode (~28.6 s of in-game time at ticrate=35).
+timeout: 1000
+quiet_vizdoom_logs: true
+vizdoom_init_progress: true
+vizdoom_init_retries: 3
+vizdoom_init_retry_delay_s: 2.0
+vizdoom_init_jitter_s: 1.0
+vizdoom_port_min: 20000
+vizdoom_port_max: 29999
+objects_info: true
+object_info_max_objects: 30
+
+# Action space restriction:
+#   "full"                       -> Discrete(16): every combination of the 4
+#                                   binary buttons (TURN_LEFT, TURN_RIGHT,
+#                                   MOVE_FORWARD, SPEED).
+#   "turn_only_forward"          -> Discrete(2): 0 = turn-left, 1 = turn-right.
+#                                   MOVE_FORWARD always held, SPEED off.
+#   "left_right_forward"         -> Discrete(3): 0 = turn-left, 1 = turn-right,
+#                                   2 = move-forward. SPEED never held; exactly
+#                                   one button pressed per step (no stand-still
+#                                   no-op).
+#   "left_right_forward_stand"   -> Discrete(4): 0 = turn-left, 1 = turn-right,
+#                                   2 = move-forward, 3 = stand-still. SPEED
+#                                   never held; exactly one (or zero) buttons
+#                                   pressed per step.
+action_set: full
+
+# Selects what the policy sees:
+#   true  -> only the raw image at ('agent','observation'). Standard pixel-based
+#            RL. Game-var / object-info tensors are still written into the
+#            rollout (so trajectory logging keeps working) but are stripped
+#            from the spec advertised to BenchMARL.
+#   false -> only the normalised ground-truth state vector at ('agent','state'),
+#            built by GroundTruthStateFromInfo (positions + sin/cos(angle) for
+#            every agent + per-object x/y/present). Use this debug mode to
+#            remove the visual encoder from the optimisation problem and
+#            check whether the policy can solve the task at all given perfect
+#            observations. Requires `objects_info: true` and
+#            `model.arch: mlp`.
+vision_only_obs: false
+
+# Position normalisation divisor for the ground-truth state vector (only
+# used when vision_only_obs=false). The ACS map for this variant spans
+# roughly [-320, 1024] in both axes — 1024 keeps coords in ~[-0.3, 1.0].
+state_coord_scale: 1024.0
+
+obs_h: 72
+obs_w: 96
+frame_stack: 1
+
+seed: 0
+total_steps: 1_000_000
+train_device: auto
+sampling_device: cpu
+buffer_device: cpu
+num_envs: 16
+parallel_collection: true
+rollout_steps: 2048
+# rollout_steps: 1052 # total steps collect for training split by num_envs, i.e. with 1024 steps, 16 envs, each env will collect 1024/16 = 64 steps for training
+# Desynchronize each env's episode phase at startup so terminal frames appear
+# in every rollout instead of only every (timeout / steps_per_env_per_iter)
+# iters. Per-env warmup length is chosen automatically from num_envs,
+# rollout_steps and timeout (skipped if a single iter already spans an
+# episode per env). Cheap one-time cost.
+desync_warmup: true
+minibatch_size: 256
+num_epochs: 6
+lr: 4.0e-4
+gamma: 0.99
+# Tighter gradient clipping helps LSTM gradient flow stability (BenchMARL
+# default is clip_grad_norm=True, clip_grad_val=5.0 — too loose for LSTM).
+max_grad_norm: 0.5
+# GAE lambda is per-algo (PPO families read it as `lmbda` inside their kwargs);
+# see <algo>_kwargs.lmbda below. Off-policy algos (qmix/vdn/iql/m?sac) ignore it.
+
+# ── Off-policy collection hyperparams (qmix / vdn / iql / m?sac) ─────────
+# Ignored by on-policy algos. Each iter collects `rollout_steps` frames into
+# the replay buffer, then runs `n_optimizer_steps` SGD updates of
+# `train_batch_size` samples each. `init_random_frames` warms the buffer
+# with random-policy data before learning starts.
+n_optimizer_steps: 32
+train_batch_size: 256
+memory_size: 100_000
+init_random_frames: 10_000
+
+video_fps: 10
+
+model:
+  # `mlp` arch consumes only the ground-truth state vector at ('agent','state')
+  # (see vision_only_obs: false above). For pixel-based runs switch back to
+  # `nature_cnn` (or small_resnet / hf_dinov3) and set vision_only_obs: true.
+  arch: mlp
+  cnn_cells: [32, 64, 64]
+  cnn_kernels: [8, 4, 3]
+  cnn_strides: [4, 2, 1]
+  cnn_paddings: [0, 0, 0]
+  mlp_cells: [256, 256]
+  # none | lstm | gru.
+  # none ignores lstm/gru blocks below; default matches lstm:.
+  rnn_type: lstm
+  # Native BenchMARL LSTM head wrapped around the CNN backbone via
+  # SequenceModelConfig([CnnConfig, LstmConfig]). Replaces frame stacking as
+  # the temporal mechanism. Only compatible with on-policy algos
+  # (mappo / ippo / contrastive_mappo).
+  lstm:
+    hidden_size: 128
+    n_layers: 1
+    bias: true
+    dropout: 0.0
+    compile: false
+    mlp_num_cells: [128]
+
+# Per-candidate algo selection. The active `algo` picks which `<algo>_kwargs`
+# block is consumed (run.py::build_algo_config). Every supported BenchMARL
+# algo has its own kwargs block here so swapping algos is just
+# `--set candidates.baseline.algo=ippo` — no kwargs edits required.
+#
+# `contrastive_mappo` is mappo + an auxiliary contrastive alignment loss on
+# the vision encoder; it reuses `mappo_kwargs` for the PPO core and overlays
+# `contrastive_kwargs` for the auxiliary terms.
+candidates:
+  baseline:
+    algo: mappo
+
+    # ── On-policy (PPO family) ────────────────────────────────────────────
+    mappo_kwargs:
+      share_param_critic: true
+      clip_epsilon: 0.2
+      entropy_coef: 0.0064
+      critic_coef: 0.25
+      loss_critic_type: l2
+      lmbda: 0.9
+      scale_mapping: "biased_softplus_1.0"   # continuous-only, no-op for Discrete
+      use_tanh_normal: true                  # continuous-only, no-op for Discrete
+      minibatch_advantage: false
+
+    ippo_kwargs:
+      share_param_critic: true
+      clip_epsilon: 0.2
+      entropy_coef: 0.001
+      critic_coef: 1.0
+      loss_critic_type: l2
+      lmbda: 0.9
+      scale_mapping: "biased_softplus_1.0"
+      use_tanh_normal: true
+      minibatch_advantage: false
+
+    # ── Off-policy value-based (discrete-only) ────────────────────────────
+    qmix_kwargs:
+      mixing_embed_dim: 32
+      delay_value: true
+      loss_function: l2
+
+    vdn_kwargs:
+      delay_value: true
+      loss_function: l2
+
+    iql_kwargs:
+      delay_value: true
+      loss_function: l2
+
+  cecl:
+    algo: contrastive_mappo
+
+    # Reused as the PPO core for contrastive_mappo (see build_algo_config).
+    mappo_kwargs:
+      share_param_critic: true
+      clip_epsilon: 0.2
+      entropy_coef: 0.01
+      critic_coef: 1.0
+      loss_critic_type: l2
+      lmbda: 0.9
+      scale_mapping: "biased_softplus_1.0"
+      use_tanh_normal: true
+      minibatch_advantage: false
+
+    # Auxiliary contrastive alignment loss on the vision encoder, applied on
+    # top of the standard MAPPO objective.
+    contrastive_kwargs:
+      contrastive_coef: 0.05
+      contrastive_embedding_dim: 128
+      contrastive_temperature: 0.1
+      contrastive_hidden_dim: 512
+      contrastive_normalize: true
+      # "sigmoid" = per-pair SigLIP-style loss (default); "nt_xent" =
+      # multi-positive InfoNCE.
+      contrastive_loss: sigmoid
+      # Gap-zone masking on (episode_id, step_id) pairs:
+      #   |Δstep| <= w_pos AND same episode  -> positive
+      #   w_pos < |Δstep| <= w_neg AND same  -> excluded (no gradient)
+      #   |Δstep| > w_neg OR different ep    -> negative
+      # In env-step units (skip_frames=4 → 1 step ≈ 0.114s game time).
+      contrastive_w_pos: 4
+      contrastive_w_neg: 16

@@ -1,0 +1,237 @@
+#include "zcommon.acs"
+
+global int 0:reward;
+global int 1:max_num_players;
+global int 2:cost;
+
+// ── Map bounds ────────────────────────────────────────────────────────────
+int x_min_agent = -320.0;
+int x_max_agent =  352.0;
+int y_min_agent =  128.0;
+int y_max_agent = 1024.0;
+
+int x_min_objs = -608.0;
+int x_max_objs = 1056.0;
+int y_min_objs = -224.0;
+int y_max_objs = 1312.0;
+
+// ── Pair configuration ───────────────────────────────────────────────────
+#define MAX_PAIRS        15       // maximum simultaneously active pairs
+#define INITIAL_PAIRS    10       // pairs spawned at map open
+#define PAIR_HALF_GAP    80.0     // each vial is 25 units from midpoint (50 unit gap total)
+#define PAIR_EXCLUSION   400.0    // min manhattan dist between pair midpoints
+#define DESPAWN_DELAY    5        // tics before unpicked partner despawns
+#define PAIR_SPAWN_RATE  100      // tics between new-pair attempts
+#define PAIR_TID_BASE    100      // slot i → vial A TID = 100+i*2, vial B = 100+i*2+1
+
+// ── Pair state (map scope arrays, accessible from all scripts) ───────────
+int pair_active[MAX_PAIRS];   // 1 = slot in use
+int pair_mid_x[MAX_PAIRS];    // midpoint X (fixed-point)
+int pair_mid_y[MAX_PAIRS];    // midpoint Y (fixed-point)
+int pair_a_picked[MAX_PAIRS]; // 1 = vial A was picked up
+int pair_b_picked[MAX_PAIRS]; // 1 = vial B was picked up
+int pair_gen[MAX_PAIRS];      // generation counter: prevents stale despawn scripts acting on a reused slot
+int active_pair_count;        // current number of active pairs
+
+// ── Armor (distraction) state ────────────────────────────────────────────
+int object_tid  = 200;  // TID counter for armor items (starts above pair TID range 100-149)
+int n_distractions = 40;
+int spawn_delay = 60;
+
+function int AbsInt(int x)
+{
+    if (x < 0)
+    {
+        return -x;
+    }
+    return x;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SpawnItem: spawn a non-paired item (armor only) and assign its pickup script
+// ─────────────────────────────────────────────────────────────────────────
+function void SpawnItem(str item, int script_id) {
+    do {
+        int x_position = random(x_min_objs, x_max_objs);
+        int y_position = random(y_min_objs, y_max_objs);
+        int z_position = 20.0;
+        int spawned = Spawn(item, x_position, y_position, z_position, object_tid);
+    } while (spawned == 0);
+    SetThingSpecial(object_tid++, ACS_Execute, script_id, 0, 0, 0, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SpawnPair: find a free slot, find a valid midpoint, spawn two linked vials
+// Returns 1 on success, 0 if no slot or no valid position found
+// ─────────────────────────────────────────────────────────────────────────
+function int SpawnPair(void) {
+    // 1. Find a free slot
+    int slot = -1;
+    for (int i = 0; i < MAX_PAIRS; ++i) {
+        if (!pair_active[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == -1 || active_pair_count >= MAX_PAIRS) return 0;
+
+    // 2. Find a midpoint not within PAIR_EXCLUSION (manhattan) of any active pair
+    int mid_x, mid_y, valid;
+    int attempts = 0;
+    do {
+        // Shrink x range by PAIR_HALF_GAP so vials stay inside the object bounds
+        mid_x = random(x_min_objs + PAIR_HALF_GAP, x_max_objs - PAIR_HALF_GAP);
+        mid_y = random(y_min_objs, y_max_objs);
+        valid = 1;
+        for (int j = 0; j < MAX_PAIRS; ++j) {
+            if (pair_active[j]) {
+                int dx = AbsInt(mid_x - pair_mid_x[j]);
+                int dy = AbsInt(mid_y - pair_mid_y[j]);
+                if (dx + dy < PAIR_EXCLUSION) {
+                    valid = 0;
+                    break;
+                }
+            }
+        }
+        ++attempts;
+    } while (!valid && attempts < 100);
+
+    if (!valid) return 0;
+
+    // 3. TIDs and generation for this slot
+    int tid_a = PAIR_TID_BASE + slot * 2;
+    int tid_b = PAIR_TID_BASE + slot * 2 + 1;
+    int gen   = pair_gen[slot] + 1;
+
+    // 4. Spawn vials: A to the west, B to the east of midpoint
+    int spawned_a = Spawn("HealthBonus", mid_x - PAIR_HALF_GAP, mid_y, 20.0, tid_a);
+    if (!spawned_a) return 0;
+
+    int spawned_b = Spawn("HealthBonus", mid_x + PAIR_HALF_GAP, mid_y, 20.0, tid_b);
+    if (!spawned_b) {
+        Thing_Remove(tid_a);
+        return 0;
+    }
+
+    // 5. Assign pickup specials
+    //    On pickup: ACS_Execute runs script 10 with args (pair_idx=slot, which_vial, gen)
+    SetThingSpecial(tid_a, ACS_Execute, 10, 0, slot, 0, gen);
+    SetThingSpecial(tid_b, ACS_Execute, 10, 0, slot, 1, gen);
+
+    // 6. Register slot
+    pair_active[slot]   = 1;
+    pair_mid_x[slot]    = mid_x;
+    pair_mid_y[slot]    = mid_y;
+    pair_a_picked[slot] = 0;
+    pair_b_picked[slot] = 0;
+    pair_gen[slot]      = gen;
+    active_pair_count++;
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 1 OPEN: initialise, spawn initial pairs + distractions, run loops
+// ─────────────────────────────────────────────────────────────────────────
+script 1 OPEN {
+    reward            = 0;
+    max_num_players   = 4;
+    cost              = 0;
+    active_pair_count = 0;
+
+    // Spawn 15 initial vial pairs
+    for (int i = 0; i < INITIAL_PAIRS; ++i) {
+        SpawnPair();
+    }
+
+    // Spawn initial armor distractions
+    for (int j = 0; j < n_distractions; ++j) {
+        SpawnItem("ArmorBonus", 4);
+    }
+
+    // Launch concurrent pair management loop
+    ACS_Execute(20, 0, 0, 0, 0);
+
+    // Armor replenishment loop — same rate as original (every 60 tics)
+    while (1) {
+        SpawnItem("ArmorBonus", 4);
+        delay(spawn_delay);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 20: pair management loop — tries to add one pair every 100 tics
+// ─────────────────────────────────────────────────────────────────────────
+script 20 (void) {
+    while (1) {
+        delay(PAIR_SPAWN_RATE);
+        if (active_pair_count < MAX_PAIRS) {
+            SpawnPair();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 2 ENTER: set player health to 1, clear inventory, random spawn
+// ─────────────────────────────────────────────────────────────────────────
+script 2 ENTER {
+    SetActorProperty(0, APROP_Health, 1);
+    ClearInventory();
+    do {
+        int random_x  = random(x_min_agent, x_max_agent);
+        int random_y  = random(y_min_agent, y_max_agent);
+        int z_pos     = 0.0;
+        int angle     = random(0, 255) * FixedDiv(256.0, 360.0);
+        if (SetActorPosition(0, random_x, random_y, z_pos, false)) {
+            SetActorAngle(0, angle);
+            break;
+        }
+    } while (true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 10: vial pickup handler
+//   args: pair_idx, which_vial (0=A / 1=B), gen
+//   Triggered via SetThingSpecial → ACS_Execute on item pickup
+// ─────────────────────────────────────────────────────────────────────────
+script 10 (int pair_idx, int which_vial, int gen) {
+    if (pair_active[pair_idx] && pair_gen[pair_idx] == gen) {
+        reward += 1.0;
+
+        if (which_vial == 0) {
+            pair_a_picked[pair_idx] = 1;
+        } else {
+            pair_b_picked[pair_idx] = 1;
+        }
+
+        // Start despawn-check timer for the partner vial
+        ACS_Execute(11, 0, pair_idx, gen, 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 11: despawn check — runs DESPAWN_DELAY tics after any pickup
+//   args: pair_idx, gen
+//   Removes unpicked partner; frees the slot either way
+// ─────────────────────────────────────────────────────────────────────────
+script 11 (int pair_idx, int gen) {
+    delay(DESPAWN_DELAY);
+
+    // Guard: slot may have already been resolved by a concurrent check
+    if (pair_active[pair_idx] && pair_gen[pair_idx] == gen) {
+        int tid_a = PAIR_TID_BASE + pair_idx * 2;
+        int tid_b = PAIR_TID_BASE + pair_idx * 2 + 1;
+
+        if (!pair_a_picked[pair_idx]) Thing_Remove(tid_a);
+        if (!pair_b_picked[pair_idx]) Thing_Remove(tid_b);
+
+        pair_active[pair_idx] = 0;
+        active_pair_count--;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 4: armor (distraction) pickup — increments cost signal
+// ─────────────────────────────────────────────────────────────────────────
+script 4 (void) {
+    cost += 1;
+}

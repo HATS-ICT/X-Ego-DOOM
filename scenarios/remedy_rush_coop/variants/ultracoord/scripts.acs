@@ -1,0 +1,188 @@
+#include "zcommon.acs"
+
+global int 0:reward;
+global int 1:max_num_players;
+global int 2:cost;
+
+// ── Map bounds ────────────────────────────────────────────────────────────
+int x_min_agent = -320.0;
+int x_max_agent =  352.0;
+int y_min_agent =  128.0;
+int y_max_agent = 1024.0;
+
+int x_min_objs = -608.0;
+int x_max_objs = 1056.0;
+int y_min_objs = -224.0;
+int y_max_objs = 1312.0;
+
+// ── Pair configuration ───────────────────────────────────────────────────
+#define MAX_PAIRS        15
+#define INITIAL_PAIRS    10
+#define PAIR_HALF_GAP    100.0
+#define PAIR_EXCLUSION   400.0
+#define DESPAWN_DELAY    5
+#define PAIR_SPAWN_RATE  100
+#define PAIR_TID_BASE    100
+
+// ── Pair state ───────────────────────────────────────────────────────────
+int pair_active[MAX_PAIRS];
+int pair_mid_x[MAX_PAIRS];
+int pair_mid_y[MAX_PAIRS];
+int pair_a_picked[MAX_PAIRS];
+int pair_b_picked[MAX_PAIRS];
+int pair_gen[MAX_PAIRS];
+int active_pair_count;
+
+function int AbsInt(int x) {
+    if (x < 0) return -x;
+    return x;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SpawnPair: find a free slot, find a valid midpoint, spawn two linked armor
+// ─────────────────────────────────────────────────────────────────────────
+function int SpawnPair(void) {
+    int slot = -1;
+    for (int i = 0; i < MAX_PAIRS; ++i) {
+        if (!pair_active[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == -1 || active_pair_count >= MAX_PAIRS) return 0;
+
+    int mid_x, mid_y, valid;
+    int attempts = 0;
+    do {
+        mid_x = random(x_min_objs + PAIR_HALF_GAP, x_max_objs - PAIR_HALF_GAP);
+        mid_y = random(y_min_objs, y_max_objs);
+        valid = 1;
+        for (int j = 0; j < MAX_PAIRS; ++j) {
+            if (pair_active[j]) {
+                int dx = AbsInt(mid_x - pair_mid_x[j]);
+                int dy = AbsInt(mid_y - pair_mid_y[j]);
+                if (dx + dy < PAIR_EXCLUSION) {
+                    valid = 0;
+                    break;
+                }
+            }
+        }
+        ++attempts;
+    } while (!valid && attempts < 100);
+
+    if (!valid) return 0;
+
+    int tid_a = PAIR_TID_BASE + slot * 2;
+    int tid_b = PAIR_TID_BASE + slot * 2 + 1;
+    int gen   = pair_gen[slot] + 1;
+
+    int spawned_a = Spawn("ArmorBonus", mid_x - PAIR_HALF_GAP, mid_y, 20.0, tid_a);
+    if (!spawned_a) return 0;
+
+    int spawned_b = Spawn("ArmorBonus", mid_x + PAIR_HALF_GAP, mid_y, 20.0, tid_b);
+    if (!spawned_b) {
+        Thing_Remove(tid_a);
+        return 0;
+    }
+
+    SetThingSpecial(tid_a, ACS_Execute, 10, 0, slot, 0, gen);
+    SetThingSpecial(tid_b, ACS_Execute, 10, 0, slot, 1, gen);
+
+    pair_active[slot]   = 1;
+    pair_mid_x[slot]    = mid_x;
+    pair_mid_y[slot]    = mid_y;
+    pair_a_picked[slot] = 0;
+    pair_b_picked[slot] = 0;
+    pair_gen[slot]      = gen;
+    active_pair_count++;
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 1 OPEN
+// ─────────────────────────────────────────────────────────────────────────
+script 1 OPEN {
+    reward            = 0;
+    max_num_players   = 4;
+    cost              = 0;
+    active_pair_count = 0;
+
+    for (int i = 0; i < INITIAL_PAIRS; ++i) {
+        SpawnPair();
+    }
+
+    ACS_Execute(20, 0, 0, 0, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 20: pair management loop
+// ─────────────────────────────────────────────────────────────────────────
+script 20 (void) {
+    while (1) {
+        delay(PAIR_SPAWN_RATE);
+        if (active_pair_count < MAX_PAIRS) {
+            SpawnPair();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 2 ENTER
+// ─────────────────────────────────────────────────────────────────────────
+script 2 ENTER {
+    SetActorProperty(0, APROP_Health, 1);
+    ClearInventory();
+    do {
+        int random_x = random(x_min_agent, x_max_agent);
+        int random_y = random(y_min_agent, y_max_agent);
+        int z_pos    = 0.0;
+        int angle    = random(0, 255) * FixedDiv(256.0, 360.0);
+        if (SetActorPosition(0, random_x, random_y, z_pos, false)) {
+            SetActorAngle(0, angle);
+            break;
+        }
+    } while (true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 10: armor pickup handler
+// First pick in a pair: +1. Second pick (completes the pair): +5.
+// ─────────────────────────────────────────────────────────────────────────
+script 10 (int pair_idx, int which_vial, int gen) {
+    if (pair_active[pair_idx] && pair_gen[pair_idx] == gen) {
+        int other_picked;
+        if (which_vial == 0) {
+            other_picked = pair_b_picked[pair_idx];
+            pair_a_picked[pair_idx] = 1;
+        } else {
+            other_picked = pair_a_picked[pair_idx];
+            pair_b_picked[pair_idx] = 1;
+        }
+
+        if (other_picked) {
+            reward += 5.0;
+        } else {
+            reward += 1.0;
+        }
+
+        ACS_Execute(11, 0, pair_idx, gen, 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 11: despawn check
+// ─────────────────────────────────────────────────────────────────────────
+script 11 (int pair_idx, int gen) {
+    delay(DESPAWN_DELAY);
+
+    if (pair_active[pair_idx] && pair_gen[pair_idx] == gen) {
+        int tid_a = PAIR_TID_BASE + pair_idx * 2;
+        int tid_b = PAIR_TID_BASE + pair_idx * 2 + 1;
+
+        if (!pair_a_picked[pair_idx]) Thing_Remove(tid_a);
+        if (!pair_b_picked[pair_idx]) Thing_Remove(tid_b);
+
+        pair_active[pair_idx] = 0;
+        active_pair_count--;
+    }
+}

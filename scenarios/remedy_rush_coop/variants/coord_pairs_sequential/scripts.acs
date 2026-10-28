@@ -1,0 +1,405 @@
+#include "zcommon.acs"
+
+global int 0:reward;
+global int 1:max_num_players;
+global int 2:cost;
+
+// ── Map bounds ────────────────────────────────────────────────────────────
+int x_min_agent = -320.0;
+int x_max_agent =  700.0;
+int y_min_agent =  80.0;
+int y_max_agent = 1024.0;
+
+int x_min_objs = -320.0;
+int x_max_objs = 700.0;
+int y_min_objs = 80.0;
+int y_max_objs = 1024.0;
+
+// ── Pair configuration ───────────────────────────────────────────────────
+// Sequential variant: only ONE pair exists in the map at a time. The next
+// pair spawns only after the current pair is resolved (both vials picked,
+// or the partner timed out after the first pickup).
+//
+// Pickups are detected MANUALLY by a per-tic distance poll (script 31).
+// Engine touch-pickup is disabled on the vials via SetActorFlag SPECIAL=0,
+// which lets us enforce the rule "the agent that picked the first vial
+// CANNOT pick the second" — the first picker walks through the partner
+// vial without effect; only the partner can complete the pair.
+#define MAX_PAIRS        1
+#define INITIAL_PAIRS    1
+// Total pairs the team must resolve (either fully collected OR despawned
+// after one half is grabbed) before the episode TERMINATES naturally via
+// Exit_Normal. Faster teams therefore end early; slower teams still hit
+// the engine episode_timeout (which the wrapper now reports as a
+// truncation). Distinguishing the two is required for correct value
+// bootstrapping in GAE — see doom_marl/task.py::_attach_info_cache.
+#define MAX_PAIRS_PER_EPISODE  10
+#define PAIR_HALF_GAP    80.0
+#define PAIR_EXCLUSION   400.0
+// Ticks the partner vial stays alive after one half is picked up.
+#define DESPAWN_DELAY    35
+#define PAIR_TID_BASE    100
+// Distance at which a player is considered to "touch" a vial. Roughly
+// matches the engine touch threshold (player radius ~16 + vial radius 48).
+// Plain integer (map units, NOT fixed-point) so we can square it without
+// overflow — see comment in script 31 for why FixedMul on positions is
+// unsafe for any non-trivial distance.
+#define PICKUP_RADIUS    64
+
+// ── Facing-the-reward shaping ────────────────────────────────────────────
+// Small per-tic bonus awarded to a player whose view direction lies within
+// FACING_CONE_FRAC of (the angle to) one of the active pair's still-alive
+// vials. Bonus accumulates into the same global `reward` variable as the
+// pickup rewards, capped per-pair so it cannot dominate the ±1 / ±2 main
+// signal. Disable by setting FACING_REWARD_PER_TIC to 0.
+#define MAX_PLAYERS              4
+#define PLAYER_TID_BASE          800
+// Cone half-width as a fraction of a full circle. 0.04 ≈ 14.4°.
+#define FACING_CONE_FRAC         0.12
+// Per-tic reward while inside the cone.
+#define FACING_REWARD_PER_TIC    0.003
+// Per-pair cap of total facing-reward emitted per player. With the values
+// above this caps shaping at +0.2 per player per pair, ~10% of the +2 coop
+// reward. Lower the cap or PER_TIC to weaken the shaping signal.
+#define FACING_REWARD_CAP_PAIR   0.8
+
+// ── Pair state ───────────────────────────────────────────────────────────
+int pair_active[MAX_PAIRS];
+int pair_mid_x[MAX_PAIRS];
+int pair_mid_y[MAX_PAIRS];
+int pair_a_picked[MAX_PAIRS];
+int pair_b_picked[MAX_PAIRS];
+int pair_gen[MAX_PAIRS];
+// PlayerNumber() of whoever picked the first vial of the pair, or -1 if
+// neither vial has been picked yet. Reset to -1 by SpawnPair.
+int pair_first_picker[MAX_PAIRS];
+int active_pair_count;
+// Total pairs resolved this episode, across all slots. A pair is "resolved"
+// either by a successful coop pickup (TryPickup, second vial taken by the
+// partner) or by the despawn timer firing (script 11). Once this reaches
+// MAX_PAIRS_PER_EPISODE, FinishEpisode() is invoked instead of spawning a
+// new pair, so is_episode_finished() flips to True before episode_timeout.
+int pairs_resolved;
+
+// Per-player accumulated facing-reward for the current pair. Reset by
+// SpawnPair so each new pair starts fresh.
+int facing_reward_used[MAX_PLAYERS];
+
+function int AbsInt(int x) {
+    if (x < 0) return -x;
+    return x;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FinishEpisode: called after every pair resolution (full pickup OR
+// despawn). Increments the global counter; if the per-episode budget has
+// been spent, exits the level so ViZDoom's is_episode_finished() flips
+// True before the engine timeout — producing a real terminal for GAE.
+// Otherwise spawns the next pair as usual. Returns 1 if the episode is
+// ending, 0 if a new pair was rolled.
+// ─────────────────────────────────────────────────────────────────────────
+function int FinishEpisode(void) {
+    pairs_resolved++;
+    if (pairs_resolved >= MAX_PAIRS_PER_EPISODE) {
+        Exit_Normal(0);
+        return 1;
+    }
+    SpawnPair();
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TryPickup: apply a pickup of vial `which` (0 = A, 1 = B) of `slot` by
+// player `p`. Enforces the "first picker cannot pick the second" rule.
+// Returns 1 if the action consumed a vial, 0 if it was rejected.
+// ─────────────────────────────────────────────────────────────────────────
+function int TryPickup(int slot, int which, int p) {
+    int tid = PAIR_TID_BASE + slot * 2 + which;
+
+    if (pair_first_picker[slot] == -1) {
+        // First pickup of the pair.
+        pair_first_picker[slot] = p;
+        if (which == 0) pair_a_picked[slot] = 1;
+        else            pair_b_picked[slot] = 1;
+        Thing_Remove(tid);
+        reward += 1.0;
+        ACS_Execute(11, 0, slot, pair_gen[slot], 0);
+        return 1;
+    }
+
+    // Second pickup. Only the partner (not the first picker) can complete
+    // the pair; the first picker passes through the partner vial.
+    if (p == pair_first_picker[slot]) return 0;
+
+    if (which == 0) pair_a_picked[slot] = 1;
+    else            pair_b_picked[slot] = 1;
+    Thing_Remove(tid);
+    reward += 2.0;
+    pair_active[slot] = 0;
+    active_pair_count--;
+    FinishEpisode();
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SpawnPair: find a free slot, find a valid midpoint, spawn two linked
+// armor bonuses with engine touch-pickup disabled.
+// ─────────────────────────────────────────────────────────────────────────
+function int SpawnPair(void) {
+    int slot = -1;
+    for (int i = 0; i < MAX_PAIRS; ++i) {
+        if (!pair_active[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == -1 || active_pair_count >= MAX_PAIRS) return 0;
+
+    int tid_a = PAIR_TID_BASE + slot * 2;
+    int tid_b = PAIR_TID_BASE + slot * 2 + 1;
+    int gen   = pair_gen[slot] + 1;
+
+    // Retry the random midpoint until BOTH the exclusion check passes AND
+    // Spawn() actually succeeds (the chosen midpoint may be inside a wall,
+    // in a void sector, or otherwise unreachable). Without this, a single
+    // bad roll leaves the map empty until episode timeout because no other
+    // code path triggers another SpawnPair.
+    int mid_x, mid_y;
+    int attempts = 0;
+    int spawned = 0;
+    do {
+        mid_x = random(x_min_objs + PAIR_HALF_GAP, x_max_objs - PAIR_HALF_GAP);
+        mid_y = random(y_min_objs, y_max_objs);
+
+        int reject = 0;
+        for (int j = 0; j < MAX_PAIRS; ++j) {
+            if (pair_active[j]) {
+                int dx = AbsInt(mid_x - pair_mid_x[j]);
+                int dy = AbsInt(mid_y - pair_mid_y[j]);
+                if (dx + dy < PAIR_EXCLUSION) {
+                    reject = 1;
+                    break;
+                }
+            }
+        }
+
+        if (!reject) {
+            int sa = Spawn("ArmorBonus", mid_x - PAIR_HALF_GAP, mid_y, 20.0, tid_a);
+            if (sa) {
+                int sb = Spawn("ArmorBonus", mid_x + PAIR_HALF_GAP, mid_y, 20.0, tid_b);
+                if (sb) {
+                    spawned = 1;
+                } else {
+                    Thing_Remove(tid_a);
+                }
+            }
+        }
+        ++attempts;
+    } while (!spawned && attempts < 100);
+
+    if (!spawned) return 0;
+
+    // Enlarge the pickup hitbox + visual sprite. Stays under the original
+    // class name "ArmorBonus" so downstream consumers (e.g. the pettingzoo
+    // wrapper's objects-info filter) keep recognising the actor.
+    SetActorProperty(tid_a, APROP_Radius, 48.0);
+    SetActorProperty(tid_a, APROP_Height, 48.0);
+    SetActorProperty(tid_a, APROP_ScaleX, 4.0);
+    SetActorProperty(tid_a, APROP_ScaleY, 4.0);
+    SetActorProperty(tid_b, APROP_Radius, 48.0);
+    SetActorProperty(tid_b, APROP_Height, 48.0);
+    SetActorProperty(tid_b, APROP_ScaleX, 4.0);
+    SetActorProperty(tid_b, APROP_ScaleY, 4.0);
+
+    // Disable engine-side auto touch-pickup. Script 31 polls distance each
+    // tic and drives pickup via TryPickup, so we can reject re-pickup by
+    // the agent that already grabbed the first vial.
+    SetActorFlag(tid_a, "SPECIAL", 0);
+    SetActorFlag(tid_b, "SPECIAL", 0);
+
+    pair_active[slot]       = 1;
+    pair_mid_x[slot]        = mid_x;
+    pair_mid_y[slot]        = mid_y;
+    pair_a_picked[slot]     = 0;
+    pair_b_picked[slot]     = 0;
+    pair_gen[slot]          = gen;
+    pair_first_picker[slot] = -1;
+    active_pair_count++;
+
+    // Fresh per-player facing-reward budget for this pair.
+    for (int p = 0; p < MAX_PLAYERS; ++p) {
+        facing_reward_used[p] = 0;
+    }
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 1 OPEN
+// ─────────────────────────────────────────────────────────────────────────
+script 1 OPEN {
+    reward            = 0;
+    max_num_players   = 4;
+    cost              = 0;
+    active_pair_count = 0;
+    pairs_resolved    = 0;
+
+    for (int i = 0; i < INITIAL_PAIRS; ++i) {
+        SpawnPair();
+    }
+
+    ACS_Execute(30, 0, 0, 0, 0);
+    ACS_Execute(31, 0, 0, 0, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 2 ENTER
+// ─────────────────────────────────────────────────────────────────────────
+script 2 ENTER {
+    SetActorProperty(0, APROP_Health, 1);
+    ClearInventory();
+    // Stamp a stable per-player TID so the per-tic scripts can query
+    // position/angle without iterating ActivatorTID.
+    Thing_ChangeTID(0, PLAYER_TID_BASE + PlayerNumber());
+    do {
+        int random_x = random(x_min_agent, x_max_agent);
+        int random_y = random(y_min_agent, y_max_agent);
+        int z_pos    = 0.0;
+        int angle    = random(0, 255) * FixedDiv(256.0, 360.0);
+        if (SetActorPosition(0, random_x, random_y, z_pos, false)) {
+            SetActorAngle(0, angle);
+            break;
+        }
+    } while (true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 11: partner-despawn timer
+//
+// Fires once after the first pickup. If the partner has not been picked
+// up within DESPAWN_DELAY ticks, remove it and spawn the next pair. If
+// the partner was picked in time, TryPickup will have already cleared
+// pair_active and spawned the next pair, so this becomes a no-op via the
+// pair_gen guard.
+// ─────────────────────────────────────────────────────────────────────────
+script 11 (int pair_idx, int gen) {
+    delay(DESPAWN_DELAY);
+
+    if (pair_active[pair_idx] && pair_gen[pair_idx] == gen) {
+        int tid_a = PAIR_TID_BASE + pair_idx * 2;
+        int tid_b = PAIR_TID_BASE + pair_idx * 2 + 1;
+
+        if (!pair_a_picked[pair_idx]) Thing_Remove(tid_a);
+        if (!pair_b_picked[pair_idx]) Thing_Remove(tid_b);
+
+        pair_active[pair_idx] = 0;
+        active_pair_count--;
+        FinishEpisode();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 30: per-tic facing-the-reward shaping
+//
+// Each tic, for every player whose view direction lies within
+// FACING_CONE_FRAC of (the angle to) the *midpoint* of the active pair,
+// add FACING_REWARD_PER_TIC to the global `reward`, up to a per-pair cap
+// of FACING_REWARD_CAP_PAIR (per player). Reset by SpawnPair when a new
+// pair is rolled.
+// ─────────────────────────────────────────────────────────────────────────
+script 30 (void) {
+    while (1) {
+        delay(1);
+
+        if (FACING_REWARD_PER_TIC == 0) continue;
+
+        for (int slot = 0; slot < MAX_PAIRS; ++slot) {
+            if (!pair_active[slot]) continue;
+
+            int mx = pair_mid_x[slot];
+            int my = pair_mid_y[slot];
+
+            for (int p = 0; p < MAX_PLAYERS; ++p) {
+                if (!PlayerInGame(p)) continue;
+                if (facing_reward_used[p] >= FACING_REWARD_CAP_PAIR) continue;
+
+                int ptid = PLAYER_TID_BASE + p;
+                int px = GetActorX(ptid);
+                int py = GetActorY(ptid);
+                int pang = GetActorAngle(ptid);
+
+                int diff = VectorAngle(mx - px, my - py) - pang;
+                while (diff >  0.5) diff -= 1.0;
+                while (diff < -0.5) diff += 1.0;
+
+                if (AbsInt(diff) < FACING_CONE_FRAC) {
+                    reward += FACING_REWARD_PER_TIC;
+                    facing_reward_used[p] += FACING_REWARD_PER_TIC;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Script 31: per-tic manual pickup poll
+//
+// For each active pair × player, check distance to each still-alive vial.
+// When a player is within PICKUP_RADIUS, hand off to TryPickup which
+// enforces the "first picker cannot complete the pair" rule.
+// ─────────────────────────────────────────────────────────────────────────
+script 31 (void) {
+    // PICKUP_RADIUS is a plain integer here (map units). Squaring gives a
+    // small int we can compare against integer squared distance.
+    //
+    // IMPORTANT: do NOT use FixedMul on coordinate deltas. ACS ints are
+    // 32-bit and FixedMul(a,b) = (a*b) >> 16; the raw product overflows
+    // 32-bit signed for any |delta| > ~181 in fixed-point representation,
+    // wrapping to garbage that can falsely satisfy a `< r2` check and
+    // trigger phantom pickups from across the map. We instead drop the
+    // fractional bits with `>> 16` (arithmetic shift, sign-preserving)
+    // and do the multiply in integer space — comfortable headroom for
+    // any reasonable map.
+    int r2 = PICKUP_RADIUS * PICKUP_RADIUS;
+
+    while (1) {
+        delay(1);
+
+        for (int slot = 0; slot < MAX_PAIRS; ++slot) {
+            if (!pair_active[slot]) continue;
+
+            int tid_a = PAIR_TID_BASE + slot * 2;
+            int tid_b = PAIR_TID_BASE + slot * 2 + 1;
+
+            for (int p = 0; p < MAX_PLAYERS; ++p) {
+                if (!PlayerInGame(p)) continue;
+                // A previous player in this same tic may have completed
+                // the pair (which immediately spawns the next one); bail
+                // out of the player loop so the new pair gets a fresh tic.
+                if (!pair_active[slot]) break;
+
+                int ptid = PLAYER_TID_BASE + p;
+                int px = GetActorX(ptid);
+                int py = GetActorY(ptid);
+
+                if (!pair_a_picked[slot]) {
+                    int dxa = (px - GetActorX(tid_a)) >> 16;
+                    int dya = (py - GetActorY(tid_a)) >> 16;
+                    int d2a = dxa * dxa + dya * dya;
+                    if (d2a < r2) {
+                        TryPickup(slot, 0, p);
+                        if (!pair_active[slot]) break;
+                    }
+                }
+                if (!pair_b_picked[slot]) {
+                    int dxb = (px - GetActorX(tid_b)) >> 16;
+                    int dyb = (py - GetActorY(tid_b)) >> 16;
+                    int d2b = dxb * dxb + dyb * dyb;
+                    if (d2b < r2) {
+                        TryPickup(slot, 1, p);
+                        if (!pair_active[slot]) break;
+                    }
+                }
+            }
+        }
+    }
+}

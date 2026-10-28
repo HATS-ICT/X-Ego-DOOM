@@ -1,0 +1,249 @@
+# =============================================================================
+# config_commented.yaml — REFERENCE / DOCUMENTATION CONFIG
+#
+# This file is *not* meant to be run as-is. It enumerates every supported
+# experiment-config key with its purpose, allowed values, and defaults.
+# Copy real configs in this same directory (e.g. remedy_rush_coop.yaml) and
+# pass them to:  python run.py experiments/<name>.yaml
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Logging / W&B
+# -----------------------------------------------------------------------------
+
+# W&B project name. Group identifier on wandb.ai.
+wandb_project: doom-marl-cl
+
+# -----------------------------------------------------------------------------
+# Evaluation (deterministic policy rollouts on a separate test env)
+#
+# `every_n_iters` controls how often BenchMARL pauses training to run one
+# eval episode. The two telemetry channels — POV mp4 video and top-down
+# trajectory plot — are gated under this block. Their cadence is expressed
+# as a multiple of eval calls (`every_n_evals`), so they always co-occur
+# with an eval step. With every_n_iters=5 and trajectory_plot_every_n_evals=2,
+# you get a trajectory plot every 10 training iterations.
+# -----------------------------------------------------------------------------
+eval:
+  every_n_iters: 5                 # iters between eval rollouts (1 iter == rollout_steps frames).
+  enable_video: false              # record eval POV mp4 (one mp4 per qualifying eval).
+  video_every_n_evals: 1           # >=1; record every Nth eval (multiplier on every_n_iters).
+  enable_trajectory_plot: true     # log eval-trajectory matplotlib panel + point table to W&B.
+  trajectory_plot_every_n_evals: 1 # >=1; plot every Nth eval (multiplier on every_n_iters).
+
+# Save a checkpoint every N collection iterations.
+checkpoint_every_n_iters: 100
+
+
+# -----------------------------------------------------------------------------
+# Scenario selection
+#
+# Two modes:
+#   (a) scenario_dir + variant  → uses the local scenario builder under
+#       scenarios/<scenario_dir>/variants/<variant>/. Preferred for new work.
+#   (b) scenario (legacy)       → bare scenario name resolved against the
+#       installed vizdoom scenarios directory. No local variant.
+# -----------------------------------------------------------------------------
+
+scenario_dir: remedy_rush_coop          # folder under ./scenarios/
+variant: coord_pairs                    # subfolder under variants/
+
+# Legacy alternative (do not set together with scenario_dir):
+# scenario: remedy_rush_coop_multi_agent
+
+
+# -----------------------------------------------------------------------------
+# ViZDoom environment
+# -----------------------------------------------------------------------------
+
+num_agents: 2          # number of co-op agents in the scenario
+resolution: "320X240"  # ViZDoom screen buffer size. Allowed values are the
+                       # ViZDoom enum strings: "160X120", "200X150", "256X144",
+                       # "256X192", "320X240", "400X300", "512X288", "512X384",
+                       # "640X360", "640X480", "800X600", etc. Larger costs FPS.
+skip_frames: 4         # number of game tics one env step advances. Higher =
+                       # faster but coarser action timing.
+async_mode: true       # ViZDoom multiplayer async sync (true is the usual
+                       # setting for parallel multi-agent envs).
+host_address: "127.0.0.1"
+netmode: 1             # 0 = peer-to-peer, 1 = packet-server (default), 2 = master.
+ticrate: 35            # game tics per second.
+daemon: true           # spawn vizdoom agent processes as daemons.
+render_mode: rgb_array # "rgb_array" returns image obs; "human" pops a window.
+timeout: 1000          # max env steps per episode before truncation.
+
+# Logging knobs for ViZDoom subprocess noise:
+quiet_vizdoom_logs: true       # suppress native vizdoom stdout/stderr.
+vizdoom_init_progress: true    # print "starting/ready" status per worker.
+vizdoom_init_retries: 3        # retry transient multiplayer startup failures.
+vizdoom_init_retry_delay_s: 2.0
+vizdoom_init_jitter_s: 1.0     # random per-worker delay before each init attempt.
+vizdoom_port_min: 20000        # default range avoids Linux ephemeral ports.
+vizdoom_port_max: 29999
+
+
+# -----------------------------------------------------------------------------
+# Observation pipeline (model input)
+# -----------------------------------------------------------------------------
+
+obs_h: 72              # resized observation height fed to the policy network.
+obs_w: 96              # resized observation width.
+frame_stack: 1         # number of consecutive frames stacked along the channel
+                       # axis. 1 = no stacking. 4 is a classic Atari setting.
+
+
+# -----------------------------------------------------------------------------
+# Training (PPO/MAPPO core hyperparameters)
+# -----------------------------------------------------------------------------
+
+seed: 0                # global RNG seed.
+total_steps: 10_000_000  # max env frames before training stops.
+
+train_device: auto     # "auto" → cuda if available, else cpu. Or "cuda"/"cpu".
+sampling_device: cpu   # device for collector/env interaction. CPU is normal.
+buffer_device: cpu     # device the rollout buffer lives on.
+
+num_envs: 32           # parallel env workers per collector.
+parallel_collection: true   # use a parallel data collector (otherwise single).
+rollout_steps: 32      # frames per env per training iteration before update.
+                       # Total batch per iter = num_envs * rollout_steps.
+minibatch_size: 8      # SGD minibatch size (must be <= rollout_steps).
+num_epochs: 10         # PPO epochs per rollout batch.
+lr: 3.0e-4
+gamma: 0.99            # discount factor.
+                       # GAE lambda is per-algo: see `lmbda` in mappo_kwargs.
+
+
+# -----------------------------------------------------------------------------
+# Video / trajectory shared knobs
+#   The `eval:` block above gates *when* mp4s and trajectory plots are
+#   produced; the keys below tune the rendering itself.
+# -----------------------------------------------------------------------------
+
+video_fps: 35   # output mp4 framerate.
+
+# Env vars (set at runtime, not in YAML):
+#   DOOM_VIDEO_DIR        — auto-set by VizdoomExperiment to <run_folder>/videos
+#   DOOM_VIDEO_TOPDOWN=0  — disable the matplotlib trajectory panel
+#   DOOM_VIDEO_SCALE=N    — final mp4 upscale factor (default 3)
+
+
+# -----------------------------------------------------------------------------
+# Object-info side channel (used by the trajectory panel and eval.py topdowns)
+# -----------------------------------------------------------------------------
+
+objects_info: true                # populates info["objects"] each step.
+object_info_max_objects: 64       # cap on #objects per step in info dict.
+
+
+# -----------------------------------------------------------------------------
+# Action / observation surface exposed to the policy
+# -----------------------------------------------------------------------------
+
+# Action space restriction (required):
+#   "full"                     -> Discrete(16): every combination of the 4
+#                                 binary buttons (TURN_LEFT, TURN_RIGHT,
+#                                 MOVE_FORWARD, SPEED).
+#   "turn_only_forward"        -> Discrete(2): turn-left / turn-right, with
+#                                 MOVE_FORWARD always held, SPEED off.
+#   "left_right_forward"       -> Discrete(3): turn-left / turn-right /
+#                                 move-forward, exactly one button per step.
+#   "left_right_forward_stand" -> Discrete(4): as above plus stand-still.
+action_set: full
+
+# Policy input (required):
+#   true  -> policy sees only the image observation (standard pixel-based RL).
+#   false -> debug mode: policy sees only a normalized ground-truth state
+#            vector (agent + object coords; needs objects_info: true and
+#            model.arch: mlp) instead of pixels.
+vision_only_obs: true
+
+
+# -----------------------------------------------------------------------------
+# Policy/value network
+#
+# arch options:
+#   nature_cnn / cnn        — DQN-style CNN backbone (default if 'model' omitted)
+#   small_resnet            — torchvision-style small ResNet (configurable depth)
+#   hf_dinov3               — HuggingFace DINOv3 ViT-S/16 backbone
+# -----------------------------------------------------------------------------
+
+model:
+  arch: small_resnet
+
+  # ── nature_cnn / cnn options ──────────────────────────────────────────────
+  # cnn_cells:    [32, 64, 64]   # output channels per conv layer
+  # cnn_kernels:  [8, 4, 3]
+  # cnn_strides:  [4, 2, 1]
+  # cnn_paddings: [0, 0, 0]
+  # mlp_cells:    [512]          # MLP head hidden sizes
+
+  # ── small_resnet options ──────────────────────────────────────────────────
+  feature_dim: 256                # output feature width before MLP head.
+  resnet_layers: [1, 1, 1, 1]     # blocks per stage (length 4).
+  stem_kernel_size: 3
+  stem_stride: 1
+  stem_padding: 1
+  use_maxpool: false              # apply maxpool after stem?
+  mlp_cells: [512]                # MLP head hidden sizes (same key as cnn).
+
+  # ── hf_dinov3 options ─────────────────────────────────────────────────────
+  # model_name: facebook/dinov3-vits16-pretrain-lvd1689m
+  # image_size: 224               # ViT input size; obs is resized to this.
+  # freeze_backbone: true         # if true, only MLP head is trained.
+  # normalize: true               # apply standard ImageNet normalization.
+  # feature_source: pooler_output # or "last_hidden_state_cls", "mean".
+  # local_files_only: false       # use only cached HF weights (offline mode).
+  # encoder_batch_size: 64        # max forward batch through the ViT.
+  # mlp_cells: [512]
+
+
+# -----------------------------------------------------------------------------
+# Candidates (algorithms / variants of the experiment)
+#
+# Each candidate becomes a separate run with its own algo + kwargs. Pick one
+# at runtime with:  python run.py <config>.yaml --candidate cecl
+# Default candidate is "baseline".
+#
+# The active `algo` selects which `<algo>_kwargs` block is read
+# (run.py::build_algo_config), e.g. algo: ippo reads ippo_kwargs. A candidate
+# may hold blocks for several algos so that
+#   --set candidates.baseline.algo=ippo
+# switches algorithm without editing kwargs. `contrastive_mappo` is the
+# exception: it reads `mappo_kwargs` (PPO core) plus `contrastive_kwargs`
+# (auxiliary loss).
+# -----------------------------------------------------------------------------
+
+candidates:
+  baseline:
+    algo: mappo                       # options: mappo, ippo, contrastive_mappo, qmix, vdn, iql
+    mappo_kwargs:
+      share_param_critic: true        # one critic shared across agents.
+      clip_epsilon: 0.2               # PPO clip range.
+      entropy_coef: 0.01
+      critic_coef: 1.0
+      loss_critic_type: l2            # l2 or smooth_l1.
+      lmbda: 0.9                      # GAE lambda for the algo internals.
+      scale_mapping: "biased_softplus_1.0"   # action stddev parameterization
+      use_tanh_normal: true                  # squash actions into [-1, 1].
+      minibatch_advantage: false             # recompute GAE per minibatch?
+
+  cecl:
+    algo: contrastive_mappo
+    mappo_kwargs:                     # same PPO core as baseline.
+      share_param_critic: true
+      clip_epsilon: 0.2
+      entropy_coef: 0.01
+      critic_coef: 1.0
+      loss_critic_type: l2
+      lmbda: 0.9
+      scale_mapping: "biased_softplus_1.0"
+      use_tanh_normal: true
+      minibatch_advantage: false
+    contrastive_kwargs:
+      contrastive_coef: 0.05               # weight of contrastive aux loss.
+      contrastive_embedding_dim: 128        # projection head output dim.
+      contrastive_temperature: 0.1          # InfoNCE / sigmoid temperature.
+      contrastive_hidden_dim: 512           # projection MLP hidden width.
+      contrastive_normalize: true           # L2-normalize embeddings.

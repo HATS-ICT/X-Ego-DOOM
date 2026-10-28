@@ -1,0 +1,91 @@
+wandb_project: doom-marl-cl
+eval:
+  every_n_iters: 5
+  enable_video: true
+  video_every_n_evals: 1
+  enable_trajectory_plot: true
+  trajectory_plot_every_n_evals: 1
+checkpoint_every_n_iters: 100
+
+scenario_dir: remedy_rush_coop
+variant: coord_pairs_mixed
+num_agents: 2
+resolution: "160X120"
+skip_frames: 4
+async_mode: true
+host_address: "127.0.0.1"
+netmode: 1
+ticrate: 35
+daemon: true
+render_mode: rgb_array
+timeout: 1000
+quiet_vizdoom_logs: true
+vizdoom_init_progress: true
+objects_info: true
+object_info_max_objects: 64
+# Action space restriction (see config_commented.yaml for all options).
+# "full" -> Discrete(16): every combination of TURN_LEFT, TURN_RIGHT,
+# MOVE_FORWARD, SPEED.
+action_set: full
+# Policy sees only the image observation (standard pixel-based RL).
+vision_only_obs: true
+
+obs_h: 72
+obs_w: 96
+frame_stack: 1
+
+seed: 0
+total_steps: 10_000_000
+train_device: auto
+sampling_device: cpu
+buffer_device: cpu
+num_envs: 16
+parallel_collection: true
+rollout_steps: 1024
+minibatch_size: 1024
+num_epochs: 10
+lr: 5.0e-5
+gamma: 0.99
+
+video_fps: 35
+
+model:
+  arch: nature_cnn
+  cnn_cells: [32, 64, 64]
+  cnn_kernels: [8, 4, 3]
+  cnn_strides: [4, 2, 1]
+  cnn_paddings: [0, 0, 0]
+  mlp_cells: [512]
+
+candidates:
+  baseline:
+    algo: mappo
+    mappo_kwargs:
+      share_param_critic: true
+      clip_epsilon: 0.2
+      entropy_coef: 0.01
+      critic_coef: 1.0
+      loss_critic_type: l2
+      lmbda: 0.9
+      scale_mapping: "biased_softplus_1.0"
+      use_tanh_normal: true
+      minibatch_advantage: false
+
+  cecl:
+    algo: contrastive_mappo
+    mappo_kwargs:
+      share_param_critic: true
+      clip_epsilon: 0.2
+      entropy_coef: 0.01
+      critic_coef: 1.0
+      loss_critic_type: l2
+      lmbda: 0.9
+      scale_mapping: "biased_softplus_1.0"
+      use_tanh_normal: true
+      minibatch_advantage: false
+    contrastive_kwargs:
+      contrastive_coef: 0.05
+      contrastive_embedding_dim: 128
+      contrastive_temperature: 0.1
+      contrastive_hidden_dim: 512
+      contrastive_normalize: true

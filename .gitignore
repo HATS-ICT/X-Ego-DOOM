@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+
+# Experiment outputs
+outputs/
+logs/
+eval_outputs/
+
+# ViZDoom runtime/config artifacts
+_vizdoom/
+_vizdoom.ini
+
+# Compiled scenario variants (reproducible from scenarios/*/variants/*.acs)
+scenarios_built/
+
+# OS/editor noise
+.DS_Store
+CLAUDE.md
+.claude/
+
+wandb/
